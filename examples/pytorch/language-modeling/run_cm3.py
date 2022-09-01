@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
 
+import torch
 import datasets
 from datasets import load_dataset
 
@@ -443,20 +444,8 @@ def main():
     # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
     tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
 
-    # return tensors in the case of not implementing FIM in-context chunking
-    def tokenize_function_non_fim(examples):
-        with CaptureLogger(tok_logger) as cl:
-            output = tokenizer(examples[text_column_name], return_tensors='pt')
-        # clm input could be much much longer than block_size
-        if "Token indices sequence length is longer than the" in cl.out:
-            tok_logger.warning(
-                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
-                " before being passed to the model."
-            )
-        return output
-
-    # return list in the case of implementing FIM in-context chunking
-    def tokenize_function_fim(examples):
+    # tokenization function
+    def tokenize_function(examples):
         with CaptureLogger(tok_logger) as cl:
             output = tokenizer(examples[text_column_name])
         # clm input could be much much longer than block_size
@@ -468,25 +457,15 @@ def main():
         return output
 
     with training_args.main_process_first(desc="dataset map tokenization"):
-        if model_args.use_fim:
-            tokenized_datasets = raw_datasets.map(
-                tokenize_function_fim,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on dataset",
-            )
+        tokenized_datasets = raw_datasets.map(
+            tokenize_function,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=column_names,
+            load_from_cache_file=not data_args.overwrite_cache,
+            desc="Running tokenizer on dataset",
+        )
 
-        else:
-            tokenized_datasets = raw_datasets.map(
-                tokenize_function_non_fim,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
-                desc="Running tokenizer on dataset",
-            )
 
     if data_args.block_size is None:
         block_size = tokenizer.model_max_length
@@ -527,7 +506,7 @@ def main():
     # So each chunk contains at most one document, but a document can occur in multiple chunks.
 
     def chunking_no_fim_function(examples):
-        example_length = list(examples[list(examples.keys())[0]].shape)[0]
+        example_length = len(examples[list(examples.keys())[0]])
         total_length = example_length
         # We add padding if the documents length is longer than multiple of block size
         if total_length >= block_size:
@@ -547,8 +526,8 @@ def main():
                 if i == 0:
                     result[k] = []
                     # Exclude bos token from causal masking
-                    item = item[1:]
-                    bos_tensor = item[0]
+                    item = torch.tensor(item[1:])
+                    bos_tensor = torch.tensor([bos_token_id])
                 
                 assert list(item.shape)[0] > 0
                 spans = get_spans_to_mask(list(item.shape)[0], sentinel_tokens)
@@ -602,11 +581,10 @@ def main():
                 for item in item_split:
                     assert len(item) > 0
                     spans = get_spans_to_mask(len(item), sentinel_tokens)
-                    
                     # Convert item to tensor
                     item = torch.tensor(item)
                     bos_tensor = torch.tensor([bos_token_id])
-
+                    
                     if spans is None:
                         sentinel_masked_result.append(torch.cat([bos_tensor, item]))
                     else:
