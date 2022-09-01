@@ -24,6 +24,7 @@ import logging
 import math
 import os
 import sys
+import random
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional
@@ -440,25 +441,31 @@ def main():
     else:
         column_names = raw_datasets["validation"].column_names
     text_column_name = "file_contents" if "file_contents" in column_names else column_names[0]
+    file_column_name = "filename" if "filename" in column_names else column_names[1]
 
-    # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
-    tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
+    # preprocessing function
+    def preprocess_function(examples):
+        # find file extension
+        ind = examples[file_column_name].rfind('.')
+        file_ext = examples[ind:]
 
-    # tokenization function
-    def tokenize_function(examples):
-        with CaptureLogger(tok_logger) as cl:
-            output = tokenizer(examples[text_column_name])
-        # clm input could be much much longer than block_size
-        if "Token indices sequence length is longer than the" in cl.out:
-            tok_logger.warning(
-                "^^^^^^^^^^^^^^^^ Please ignore the warning above - this long input will be chunked into smaller bits"
-                " before being passed to the model."
-            )
+        # append attribute to the training data 
+        # for attribute generation and prediction
+        attribute = '<| file ext=' + file_ext + ' |>'
+
+        # 50% at the beginning, 50% at the end
+        if random.randint(0, 1):
+            text = attribute + '\n' + examples[text_column_name]
+        else:
+            text = examples[text_column_name] + '\n' + attribute
+
+        # tokenization
+        output = tokenizer(text)
         return output
 
     with training_args.main_process_first(desc="dataset map tokenization"):
         tokenized_datasets = raw_datasets.map(
-            tokenize_function,
+            preprocess_function,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
             remove_columns=column_names,
@@ -584,7 +591,7 @@ def main():
                     # Convert item to tensor
                     item = torch.tensor(item)
                     bos_tensor = torch.tensor([bos_token_id])
-                    
+
                     if spans is None:
                         sentinel_masked_result.append(torch.cat([bos_tensor, item]))
                     else:
@@ -658,7 +665,7 @@ def main():
     # padding data collator
     data_collator = DataCollatorWithPadding(tokenizer, padding='max_length', max_length=block_size, return_tensors='pt')
 
-    # define a custom trainer here for weighted cross entropu
+    # define a custom trainer here for weighted cross entropy
     class CustomTrainer(Trainer):
         def compute_loss(self, model, inputs, return_outputs=False):
             labels = inputs.get("labels")
