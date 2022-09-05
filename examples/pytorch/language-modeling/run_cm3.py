@@ -20,6 +20,7 @@ https://huggingface.co/models?filter=text-generation
 """
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
+import itertools
 import logging
 import math
 import os
@@ -27,9 +28,12 @@ import sys
 import random
 from dataclasses import dataclass, field
 from itertools import chain
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn as nn
+import numpy as np
+
 import datasets
 from datasets import load_dataset
 
@@ -44,24 +48,15 @@ from transformers import (
     HfArgumentParser,
     Trainer,
     TrainingArguments,
-    default_data_collator,
     is_torch_tpu_available,
     set_seed,
     DataCollatorWithPadding
 )
 from transformers.testing_utils import CaptureLogger
 from transformers.trainer_utils import get_last_checkpoint
-from transformers.utils import check_min_version, send_example_telemetry
-from transformers.utils.versions import require_version
 
-
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.22.0.dev0")
-
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
 
 logger = logging.getLogger(__name__)
-
 
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_CAUSAL_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -194,6 +189,10 @@ class DataTrainingArguments:
     )
 
 
+_Column_Names = [
+    "file_contents", "filename", "hash", "language", "path", "repo", "row_num", "sha512", "text_content_length"
+]
+
 # load github pretraining dataset
 def load_data(data_args):
     sub_dirs = ['c', 'cpp', 'java', 'py', 'js', 'rb', 'ts', 'others', 'csharp', 'php']
@@ -206,7 +205,7 @@ def load_data(data_args):
                 local_dataset_path = os.path.join(data_args.data_path, sub_dir, split, partition_id)
                 
                 file_names = sorted(os.listdir(local_dataset_path))
-                file_names = [f for f in file_names if f.endswith(".json")]
+                file_names = [f for f in file_names if f.endswith(".json.gz")]
                 data_files = [local_dataset_path + '/' + f for f in file_names]
             
                 if split == "train":
@@ -233,6 +232,11 @@ def load_data(data_args):
     return dataset
 
 # Causal mask language modelling
+def span_intersection(left: Tuple[int, int], right: Tuple[int, int]) -> bool:
+    left_x, left_y = left
+    right_x, right_y = right
+    return max(left_x, right_x) < min(left_y, right_y)
+
 def get_sentinel(sentinel_tokens, i):
     return sentinel_tokens[i]
 
@@ -436,29 +440,21 @@ def main():
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
-    if training_args.do_train:
-        column_names = raw_datasets["train"].column_names
-    else:
-        column_names = raw_datasets["validation"].column_names
     text_column_name = "file_contents" if "file_contents" in column_names else column_names[0]
     file_column_name = "filename" if "filename" in column_names else column_names[1]
 
     # preprocessing function
     def preprocess_function(examples):
-        # find file extension
-        ind = examples[file_column_name].rfind('.')
-        file_ext = examples[ind:]
+        # append attribute to the training data for attribute generation and prediction
+        index = examples[file_column_name].rfind('.')
+        file_ext = examples[index:]
 
-        # append attribute to the training data 
-        # for attribute generation and prediction
         attribute = '<| file ext=' + file_ext + ' |>'
 
         # 50% at the beginning, 50% at the end
-        if random.randint(0, 1):
-            text = attribute + '\n' + examples[text_column_name]
-        else:
-            text = examples[text_column_name] + '\n' + attribute
-
+        rand_num = random.randint(0, 1)
+        text = f"{attribute}\n{examples[text_column_name]}" if rand_num else f"{examples[text_column_name]}\n{attribute}"
+        
         # tokenization
         output = tokenizer(text)
         return output
@@ -468,7 +464,7 @@ def main():
             preprocess_function,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
+            remove_columns=_Column_Names,
             load_from_cache_file=not data_args.overwrite_cache,
             desc="Running tokenizer on dataset",
         )
@@ -513,7 +509,7 @@ def main():
     # So each chunk contains at most one document, but a document can occur in multiple chunks.
 
     def chunking_no_fim_function(examples):
-        example_length = len(examples[list(examples.keys())[0]])
+        example_length = len(examples['input_ids'])
         total_length = example_length
         # We add padding if the documents length is longer than multiple of block size
         if total_length >= block_size:
@@ -562,7 +558,7 @@ def main():
     def chunking_fim_function(examples):
         # Concatenate all texts.
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-        concatenated_length = len(concatenated_examples[list(examples.keys())[0]])
+        concatenated_length = len(concatenated_examples['input_ids'])
         total_length = concatenated_length
         # We add padding if the documents length is longer than multiple of block size
         if total_length >= block_size:
@@ -673,9 +669,21 @@ def main():
             outputs = model(**inputs)
             logits = outputs.get("logits")
             # compute custom loss (weighted cross entropy loss)
-            loss_fct = nn.CrossEntropyLoss(weight=criterion_weights)
+            loss_fct = nn.CrossEntropyLoss(weight=criterion_weights.to(logits.device))
             loss = loss_fct(logits.view(-1, self.model.config.vocab_size), labels.view(-1))
             return (loss, outputs) if return_outputs else loss
+
+    class CodeIterDataset(torch.utils.data.IterableDataset):
+        def __init__(self, iter_dataset) -> None:
+            super().__init__()
+            self.iter_dataset = iter_dataset
+        
+        def __iter__(self):
+            return self.iter_dataset.__iter__()
+
+    train_dataset = CodeIterDataset(train_dataset)
+    eval_dataset = CodeIterDataset(eval_dataset)
+    print("train dataset type: ", isinstance(train_dataset, torch.utils.data.IterableDataset), train_dataset.__class__)
 
     # Initialize our Trainer
     trainer = CustomTrainer(
